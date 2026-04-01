@@ -148,37 +148,48 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export CCL_TOPO_P2P_ACCESS=0                            # Shared memory mode (no P2P)
 ```
 
-### Default launch (gpt-oss-20b with tool calling + reasoning)
+### General Launch Pattern
+
+Derived from testing 4B, 8B, 9B dense and 20B MoE models on Lunar Lake:
 
 ```bash
-vllm serve /shared/models/gpt-oss-20b \
+vllm serve <model-path> \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization <0.35–0.8> \
     --enforce-eager \
-    --max-model-len 32768 \
-    --enable-auto-tool-choice \
-    --tool-call-parser openai \
-    --reasoning-parser openai_gptoss
+    --max-model-len <context-length> \
+    [--quantization int4]                    # online INT4 (for BF16/FP16 models)
+    [--allow-deprecated-quantization]        # pre-quantized AutoRound/GPTQ models
+    [--enable-auto-tool-choice]              # agent/tool-calling models
+    [--tool-call-parser <parser>]            # model-specific: openai, qwen3_coder, etc.
+    [--reasoning-parser <parser>]            # model-specific: openai_gptoss, qwen3, etc.
 ```
 
-### Generic launch (other models)
+**Required flags** (all models on Lunar Lake):
 
-```bash
-vllm serve <model> \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.7 \
-    --enforce-eager \
-    --max-model-len 32768
-```
+| Flag | Why | Tested With |
+|------|-----|-------------|
+| `--tensor-parallel-size 1` | Single iGPU, no multi-GPU | All models |
+| `--enforce-eager` | XPU uses eager mode (no CUDA graphs) | All models |
+| `--gpu-memory-utilization` | Controls KV cache ceiling. 0.7 = single-model default; lower for multi-service | 0.35–0.8 across all models |
+| `--max-model-len` | Set to actual need, not model max. Does not cost memory unless used | 8K–32K tested |
 
-Add `--quantization int4` for online INT4 quantization, or `--allow-deprecated-quantization` for pre-quantized AutoRound/GPTQ models.
+**Optional flags** (model-dependent):
 
-Key flags:
+| Flag | When to Use | Example |
+|------|-------------|---------|
+| `--quantization int4` | Online INT4 for native BF16 models (e.g. Qwen3.5-9B) | Qwen3.5-9B sym_int4 |
+| `--allow-deprecated-quantization` | Pre-quantized AutoRound/GPTQ checkpoints | Qwen3.5-4B, Qwen3-8B |
+| `--enable-auto-tool-choice` | Agent use — model decides when to call tools | gpt-oss-20b, Qwen3.5-4B |
+| `--tool-call-parser <parser>` | Model-specific tool format: `openai`, `qwen3_coder` | gpt-oss-20b → `openai`, Qwen3.5 → `qwen3_coder` |
+| `--reasoning-parser <parser>` | Model-specific reasoning format: `openai_gptoss`, `qwen3` | gpt-oss-20b → `openai_gptoss`, Qwen3.5 → `qwen3` |
+
+**Key notes:**
 - `VLLM_TARGET_DEVICE=xpu` — **Environment variable** (NOT `--device xpu`, which is not a valid CLI flag)
-- `--tensor-parallel-size 1` — Single iGPU (no multi-GPU)
-- `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS). Controls KV cache pre-allocation ceiling only — real-time inference can exceed this with transient activation memory
-- `--enforce-eager` — Disable CUDA graphs (XPU uses eager mode)
-- `--max-model-len 32768` — 32K context (sweet spot for OpenClaw agent use)
+- `--gpu-memory-utilization` only controls KV cache pre-allocation — real-time inference can exceed this with transient activation memory
+- `--max-model-len 32768` does not waste memory if requests use less — cold prefill scales with actual input length
+
+See [Running Recipes](#running-recipes-msi-claw-8-ai) for complete model-specific examples.
 
 ## CCL Single-GPU Workaround
 

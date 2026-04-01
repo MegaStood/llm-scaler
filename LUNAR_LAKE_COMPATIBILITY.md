@@ -130,46 +130,55 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
-## Environment Variables
+## Environment Variables and Launch Flags
+
+All environment variables are set automatically by `vllm-activate` alias or `lunar_lake_serve.sh`. For manual setup:
 
 ```bash
-# Required for Lunar Lake
-export VLLM_TARGET_DEVICE=xpu
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-export PYTORCH_ALLOC_CONF="expandable_segments:True"
-
-# Shared memory mode (no P2P)
-export CCL_TOPO_P2P_ACCESS=0
-
-# Skip profile_run() — required for Lunar Lake iGPU (hangs during dummy forward pass)
-export VLLM_SKIP_PROFILE_RUN=1
-
 # Source oneAPI
 source /opt/intel/oneapi/setvars.sh --force
+
+# Required for Lunar Lake XPU
+export VLLM_TARGET_DEVICE=xpu                          # Device selection (NOT a CLI flag)
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_SKIP_PROFILE_RUN=1                         # Skip profile_run() hang on iGPU
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+export CCL_TOPO_P2P_ACCESS=0                            # Shared memory mode (no P2P)
 ```
 
-## vLLM Launch Flags
+### Default launch (gpt-oss-20b with tool calling + reasoning)
 
 ```bash
-# Device is set via environment variable, NOT a CLI flag
-export VLLM_TARGET_DEVICE=xpu
+vllm serve /shared/models/gpt-oss-20b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.7 \
+    --enforce-eager \
+    --max-model-len 32768 \
+    --enable-auto-tool-choice \
+    --tool-call-parser openai \
+    --reasoning-parser openai_gptoss
+```
 
+### Generic launch (other models)
+
+```bash
 vllm serve <model> \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.7 \
     --enforce-eager \
-    --quantization int4 \
-    --max-model-len 8192
+    --max-model-len 32768
 ```
+
+Add `--quantization int4` for online INT4 quantization, or `--allow-deprecated-quantization` for pre-quantized AutoRound/GPTQ models.
 
 Key flags:
 - `VLLM_TARGET_DEVICE=xpu` — **Environment variable** (NOT `--device xpu`, which is not a valid CLI flag)
 - `--tensor-parallel-size 1` — Single iGPU (no multi-GPU)
-- `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS)
+- `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS). Controls KV cache pre-allocation ceiling only — real-time inference can exceed this with transient activation memory
 - `--enforce-eager` — Disable CUDA graphs (XPU uses eager mode)
-- `--quantization int4` — Online INT4 quantization for fitting larger models in shared memory
-- `--allow-deprecated-quantization` — Required for pre-quantized AutoRound/GPTQ models
+- `--max-model-len 32768` — 32K context (sweet spot for OpenClaw agent use)
 
 ## CCL Single-GPU Workaround
 

@@ -1,6 +1,6 @@
 # GLM-4.7-Flash INT4 MoE: Marlin Shuffle DEVICE_LOST on Lunar Lake XPU
 
-## Status: BLOCKED - XPU driver limitation
+## Status: FIXED — AutoRound FusedMoE routing to IPEX native path
 
 ## Problem
 
@@ -56,37 +56,58 @@ Skip Marlin shuffle entirely, use IPEX native MoE GEMM path.
 - **Result**: `expected self and mat2 to have the same dtype, but got: c10::BFloat16 != int`
   The native path doesn't dequantize INT4 packed weights - it expects FP16/BF16.
 
-## Ideas for Future Investigation
+## Fix: AutoRound `apply_ipex_quant_layer` FusedMoE Routing (2026-04-13)
 
-### A. Patch IPEX native path to dequantize INT4
-The native `torch.xpu.moe_gemm` with `use_native=True, is_int4=True` falls back to
-plain `torch.mm` which can't handle packed INT4. If IPEX added INT4 dequantization
-in the native path (unpack INT4 -> BF16 -> GEMM), it would bypass Marlin entirely.
-- **File**: `intel_extension_for_pytorch/xpu/intrinsic/__init__.py` line ~506
-- **Effort**: Medium - need to add dequant logic per-expert in the moe_gemm native path
+The root cause was that `AutoRoundConfig.apply_ipex_quant_layer()` only handled
+`LinearBase`/`ParallelLMHead` layers. When a `FusedMoE` layer was passed:
 
-### B. Reduce model memory to make room for shuffle
-If model memory could be reduced from 16.52 GB to ~14 GB, there would be enough
-headroom for the Marlin shuffle. Options:
-- Use a more aggressive quantization (e.g. 2-bit or mixed precision)
-- Quantize the dense layer (layer 0) which is currently FP16
-- Reduce the number of loaded experts (expert parallelism / offloading)
+1. `get_quant_method()` on XPU calls `apply_ipex_quant_layer()` (line 460)
+2. `apply_ipex_quant_layer()` checks `isinstance(layer, (LinearBase, ParallelLMHead))` — `FusedMoE` doesn't match
+3. Returns `None` — the layer gets no quantization method
+4. `FusedMoE` falls back to upstream `GPTQMarlinMoEMethod` (CUDA Marlin path)
+5. `GPTQMarlinMoEMethod.process_weights_after_loading()` calls `marlin_shuffle_weight()`
+6. `marlin_shuffle_weight()` allocates large temporary tensors on XPU -> **DEVICE_LOST** on shared-memory iGPU
 
-### C. Streaming shuffle during weight loading
-Instead of loading all weights first then shuffling, interleave:
-load layer N weights -> shuffle layer N -> move to XPU -> free CPU copy -> next layer.
-This requires modifying the vLLM weight loader to call `process_weights_after_loading`
-per-layer instead of at the end.
-- **File**: `vllm/model_executor/model_loader/default_loader.py`
+Meanwhile, `IPEXConfig.get_quant_method()` in `ipex_quant.py:225-226` already has
+the correct FusedMoE routing to `XPUGPTQMarlinMoEMethod` — it just never got called
+for AutoRound models because `apply_ipex_quant_layer` returned `None` first.
 
-### D. Use GGUF via llama.cpp instead
-The `GLM-4.7-Flash-Q4_K_M.gguf` (18 GB) in `/shared/models/gguf/` can be served
-via llama.cpp with SYCL backend, which handles INT4 dequantization differently
-and doesn't need Marlin shuffle.
+### The fix
 
-### E. FP8 quantization
-Re-quantize the model to FP8 instead of INT4. The IPEX FP8 MoE path
-(`XPUFp8MoEMethod`) doesn't need Marlin shuffle. Uses `GatedMLPMOE(..., is_fp8=True)`.
+Added `FusedMoE` handling to `apply_ipex_quant_layer()` in
+`vllm/model_executor/layers/quantization/auto_round.py`:
+
+```python
+elif isinstance(layer, FusedMoE) and "gptq" in self.packing_format:
+    from vllm.model_executor.layers.quantization.ipex_quant import (
+        XPUGPTQMarlinMoEMethod,
+    )
+    config = IPEXConfig(
+        method="gptq",
+        weight_bits=weight_bits,
+        group_size=group_size,
+        is_qweight_sym=sym,
+        dynamic={},
+        full_config={},
+    )
+    return XPUGPTQMarlinMoEMethod(config, layer.moe_config)
+```
+
+This routes all INT4 AutoRound GPTQ MoE models (GLM-4.7-Flash, Gemma 4, etc.)
+to the IPEX native `XPUGPTQMarlinMoEMethod` path, which calls
+`ipex.llm.modules.GatedMLPMOE()` directly — no Marlin shuffle, no temporary
+tensor allocation, no DEVICE_LOST on shared-memory iGPU.
+
+### Affected models
+- `Intel/glm-4.7-flash-int4-autoround` (30B-A3B MoE)
+- `Intel/gemma-4-26b-a4b-it-int4-autoround` (MoE)
+- Any future INT4 AutoRound GPTQ MoE model on XPU
+
+## Previous Investigation (for reference)
+
+The approaches below were tested before the root cause was identified.
+They all attempted to work around the Marlin shuffle within the CUDA code path,
+which was the wrong path entirely.
 
 ## Related Files
 

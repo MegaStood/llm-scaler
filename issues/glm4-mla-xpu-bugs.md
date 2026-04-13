@@ -133,29 +133,12 @@ VLLM_MLA_DISABLE=0 vllm serve Intel/glm-4.7-flash-int4-autoround \
 # this is a separate MoE issue affecting all 30B-A3B models on memory-constrained devices.
 ```
 
-## Related: MoE `marlin_shuffle_weight` OOM (Separate Issue)
+## Related: MoE `marlin_shuffle_weight` DEVICE_LOST — FIXED (2026-04-13)
 
-Even with MLA working (KV cache reduced from 3.67 GiB to 0.21 GiB), GLM-4.7-flash crashes during the warmup forward pass due to `marlin_shuffle_weight` in IPEX's MoE expert reshuffling:
-```
-RuntimeError: level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
-```
-at `intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py:181`.
+Even with MLA working (KV cache reduced from 3.67 GiB to 0.21 GiB), GLM-4.7-flash was crashing during the warmup forward pass due to `marlin_shuffle_weight` in the CUDA Marlin MoE path.
 
-### Attempted workarounds (all failed on 32GB shared memory):
+**Root cause:** `AutoRoundConfig.apply_ipex_quant_layer()` didn't handle `FusedMoE` layers — it returned `None`, causing the code to fall through to the upstream CUDA `GPTQMarlinMoEMethod` which calls `marlin_shuffle_weight()` and allocates large temporary tensors, triggering `DEVICE_LOST` on shared-memory iGPU.
 
-| Approach | Result |
-|----------|--------|
-| **CPU-side shuffle** — move weights to CPU, shuffle, move back | Swap absorbs CPU temps (11 GiB swap), but `.to(xpu)` OOMs — old + new coexist briefly in GPU-mapped memory |
-| **Per-expert processing** — shuffle one expert at a time | Reduces CPU peak but result tensor `[E, k//8, N]` still full-size on return to GPU |
-| **`empty_cache()` before shuffle** | Frees ~0.5 GiB fragmented GPU memory — insufficient headroom |
-| **`IPEX_MOE_GEMM_NATIVE=1`** — bypass Marlin kernel | Native path can't handle INT4 packed weights (dtype mismatch BFloat16 != int) |
+**Fix:** Added `FusedMoE` routing in `apply_ipex_quant_layer()` to return `XPUGPTQMarlinMoEMethod` (the IPEX native path) for GPTQ-packed MoE layers. This uses `ipex.llm.modules.GatedMLPMOE()` directly — no Marlin shuffle, no temporary allocation. Applies to all INT4 AutoRound GPTQ MoE models on XPU (GLM-4.7-Flash, Gemma 4, etc.).
 
-### Root cause
-The 16.55 GiB model leaves only ~4 GiB headroom in 32GB shared memory. The `marlin_shuffle_weight` function creates a full-size output tensor per weight matrix while the original still exists — briefly requiring 2× one layer's MoE weights on GPU. On discrete GPUs this is fine (separate VRAM pool), but on shared memory systems the model + shuffle overhead exceeds the single pool.
-
-### Suggested fix for IPEX
-1. **Pre-shuffle weights offline** — save already-shuffled INT4 weights to disk, skip runtime reshuffling
-2. **True in-place shuffle** — overwrite the original weight tensor block-by-block instead of allocating a new one
-3. **Fix `IPEX_MOE_GEMM_NATIVE=1`** — make the native MoE GEMM path handle INT4 packed weights properly
-
-For full investigation details (5 approaches tested, 5 future ideas), see [`issues/glm4_moe_lite_int4_xpu_marlin_shuffle.md`](glm4_moe_lite_int4_xpu_marlin_shuffle.md).
+For full investigation details, see [`issues/glm4_moe_lite_int4_xpu_marlin_shuffle.md`](glm4_moe_lite_int4_xpu_marlin_shuffle.md).

@@ -120,7 +120,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 |-------|--------|-------------|
 | ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED & VERIFIED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). Qwen3.5-4B now runs successfully with correct triton-xpu install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`. See benchmark results below. |
 | GLM-4.7-flash AWQ | AWQ 4-bit | `CompressedTensorsWNA16MarlinMoEMethod` → `gptq_marlin_repack` CUDA kernel missing. Dense layers work via `XPUwNa16LinearKernel` but MoE layers still route to Marlin. compressed-tensors MoE has no XPU redirect. |
-| GLM-4.7-flash AutoRound INT4 | AutoRound | IPEX routing works (no Marlin error) but **OOM → DEVICE_LOST** during weight init. 30B-A3B MoE model — loaded weights exceed ~13 GiB practical ceiling on 32GB shared memory. Confirmed with 32GB swap enabled. |
+| GLM-4.7-flash AutoRound INT4 | AutoRound | **Loads but fails during warmup.** Model weights load successfully (16.16 GiB, peak 19.40 GiB) with 32GB disk swap absorbing the loading spike. Two vLLM XPU issues block it: (1) `marlin_shuffle_weight` in IPEX MoE expert reshuffling triggers DEVICE_LOST during warmup forward pass, (2) **No MLA KV compression** — vLLM stores full expanded KV (47 layers × 20 heads × 256 dim = ~940 KB/token) instead of compressed latent (kv_lora_rank=512 + rope=64 = ~53 KB/token), inflating KV cache 18×. With proper MLA support, 32K context would need only ~1.66 GiB KV cache — feasible on Lunar Lake. |
 | Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM — ~18 GiB loaded weights exceed ~13 GiB practical ceiling on 32GB shared memory |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
@@ -130,46 +130,66 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
-## Environment Variables
+## Environment Variables and Launch Flags
+
+All environment variables are set automatically by `vllm-activate` alias or `lunar_lake_serve.sh`. For manual setup:
 
 ```bash
-# Required for Lunar Lake
-export VLLM_TARGET_DEVICE=xpu
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-export PYTORCH_ALLOC_CONF="expandable_segments:True"
-
-# Shared memory mode (no P2P)
-export CCL_TOPO_P2P_ACCESS=0
-
-# Skip profile_run() — required for Lunar Lake iGPU (hangs during dummy forward pass)
-export VLLM_SKIP_PROFILE_RUN=1
-
 # Source oneAPI
 source /opt/intel/oneapi/setvars.sh --force
+
+# Required for Lunar Lake XPU
+export VLLM_TARGET_DEVICE=xpu                          # Device selection (NOT a CLI flag)
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_SKIP_PROFILE_RUN=1                         # Skip profile_run() hang on iGPU
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+export CCL_TOPO_P2P_ACCESS=0                            # Shared memory mode (no P2P)
 ```
 
-## vLLM Launch Flags
+### General Launch Pattern
+
+Derived from testing 4B, 8B, 9B dense and 20B MoE models on Lunar Lake:
 
 ```bash
-# Device is set via environment variable, NOT a CLI flag
-export VLLM_TARGET_DEVICE=xpu
-
-vllm serve <model> \
+vllm serve <model-path> \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization <0.35–0.8> \
     --enforce-eager \
-    --quantization int4 \
-    --max-model-len 8192
+    --max-model-len <context-length> \
+    [--quantization int4]                    # online INT4 (for BF16/FP16 models)
+    [--allow-deprecated-quantization]        # pre-quantized AutoRound/GPTQ models
+    [--enable-auto-tool-choice]              # agent/tool-calling models
+    [--tool-call-parser <parser>]            # model-specific: openai, qwen3_coder, etc.
+    [--reasoning-parser <parser>]            # model-specific: openai_gptoss, qwen3, etc.
 ```
 
-Key flags:
+**Required flags** (all models on Lunar Lake):
+
+| Flag | Why | Tested With |
+|------|-----|-------------|
+| `--tensor-parallel-size 1` | Single iGPU, no multi-GPU | All models |
+| `--enforce-eager` | XPU uses eager mode (no CUDA graphs) | All models |
+| `--gpu-memory-utilization` | Controls KV cache ceiling. 0.7 = single-model default; lower for multi-service | 0.35–0.8 across all models |
+| `--max-model-len` | Set to actual need, not model max. Does not cost memory unless used | 8K–32K tested |
+
+**Optional flags** (model-dependent):
+
+| Flag | When to Use | Example |
+|------|-------------|---------|
+| `--quantization int4` | Online INT4 for native BF16 models (e.g. Qwen3.5-9B) | Qwen3.5-9B sym_int4 |
+| `--allow-deprecated-quantization` | Pre-quantized AutoRound/GPTQ checkpoints | Qwen3.5-4B, Qwen3-8B |
+| `--enable-auto-tool-choice` | Agent use — model decides when to call tools | gpt-oss-20b, Qwen3.5-4B |
+| `--tool-call-parser <parser>` | Model-specific tool format: `openai`, `qwen3_coder` | gpt-oss-20b → `openai`, Qwen3.5 → `qwen3_coder` |
+| `--reasoning-parser <parser>` | Model-specific reasoning format: `openai_gptoss`, `qwen3` | gpt-oss-20b → `openai_gptoss`, Qwen3.5 → `qwen3` |
+
+**Key notes:**
 - `VLLM_TARGET_DEVICE=xpu` — **Environment variable** (NOT `--device xpu`, which is not a valid CLI flag)
-- `--tensor-parallel-size 1` — Single iGPU (no multi-GPU)
-- `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS)
-- `--enforce-eager` — Disable CUDA graphs (XPU uses eager mode)
-- `--quantization int4` — Online INT4 quantization for fitting larger models in shared memory
-- `--allow-deprecated-quantization` — Required for pre-quantized AutoRound/GPTQ models
+- `--gpu-memory-utilization` only controls KV cache pre-allocation — real-time inference can exceed this with transient activation memory
+- `--max-model-len 32768` does not waste memory if requests use less — cold prefill scales with actual input length
+
+See [Running Recipes](#running-recipes-msi-claw-8-ai) for complete model-specific examples.
 
 ## CCL Single-GPU Workaround
 
